@@ -1,5 +1,11 @@
+import contextlib
+import io
+import json
+import os
 import socket
+import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 import urlcheck as uc
@@ -103,6 +109,140 @@ class SafetyAndCliTests(unittest.TestCase):
         self.assertEqual(uc.main(["https://bit.ly/abc"]), 0)  # LOW only
         with mock.patch("sys.stdin", iter([])):
             self.assertEqual(uc.main([]), 2)
+
+
+class NewCheckTests(unittest.TestCase):
+    def test_hidden_characters(self):
+        for ch in ("\u200b", "\u202e", "\u2066", "\ufeff", "\u00ad"):
+            self.assertIn(("HIGH", "hidden-characters"), rules("https://exa%smple.com/a" % ch), repr(ch))
+
+    def test_hidden_characters_are_stripped_before_the_other_checks(self):
+        r = rules("https://pay\u200bpa1.com")
+        self.assertIn(("HIGH", "lookalike-brand"), r)
+
+    def test_double_extension(self):
+        for path in ("/invoice.pdf.exe", "/photo.jpg.scr", "/report.docx.js", "/a.xlsx.bat"):
+            self.assertIn(("HIGH", "double-extension"), rules("https://files.example.org" + path), path)
+
+    def test_plain_executable_is_only_medium(self):
+        r = rules("https://files.example.org/setup.exe")
+        self.assertIn(("MEDIUM", "risky-file"), r)
+        self.assertNotIn("double-extension", {x for _, x in r})
+
+    def test_document_alone_is_fine(self):
+        self.assertEqual(rules("https://files.example.org/report.pdf"), set())
+
+    def test_domain_in_subdomain(self):
+        self.assertIn(("MEDIUM", "domain-in-subdomain"), rules("https://mybank.com.secure-check.example.net/login"))
+        self.assertIn(("MEDIUM", "domain-in-subdomain"), rules("https://www.example.org.verify.example.net"))
+
+    def test_ordinary_subdomains_are_fine(self):
+        for url in ("https://www.example.com", "https://mail.example.co.uk", "https://shop.eu.example.net"):
+            self.assertNotIn("domain-in-subdomain", {r for _, r in rules(url)}, url)
+
+    def test_brand_in_path(self):
+        self.assertIn(("LOW", "brand-in-path"), rules("https://example.net/paypal/login"))
+        self.assertNotIn("brand-in-path", {r for _, r in rules("https://paypal.com/signin")})
+        self.assertNotIn("brand-in-path", {r for _, r in rules("https://example.net/about")})
+
+    def test_existing_checks_still_fire(self):
+        self.assertIn(("HIGH", "userinfo-trick"), rules("https://paypal.com@evil.example.net/"))
+        self.assertIn(("HIGH", "lookalike-brand"), rules("https://paypa1.com"))
+
+
+class UnwrapTests(unittest.TestCase):
+    INNER = "https://paypa1.example.net/login"
+
+    def test_safelinks(self):
+        url = "https://eur01.safelinks.protection.outlook.com/?url=%s&data=05" % urllib.parse.quote(self.INNER, safe="")
+        self.assertEqual(uc.unwrap_url(url), ("Microsoft SafeLinks", self.INNER))
+
+    def test_google_redirect(self):
+        url = "https://www.google.com/url?q=%s&sa=D" % urllib.parse.quote(self.INNER, safe="")
+        self.assertEqual(uc.unwrap_url(url), ("Google redirect", self.INNER))
+
+    def test_facebook_redirect(self):
+        url = "https://l.facebook.com/l.php?u=%s" % urllib.parse.quote(self.INNER, safe="")
+        self.assertEqual(uc.unwrap_url(url)[1], self.INNER)
+
+    def test_proofpoint_v3(self):
+        url = "https://urldefense.com/v3/__%s__;!!abc$" % self.INNER
+        self.assertEqual(uc.unwrap_url(url), ("Proofpoint URL Defense", self.INNER))
+
+    def test_not_a_wrapper(self):
+        for url in ("https://example.com/", "https://www.google.com/search?q=a", "not a url at all", ""):
+            self.assertIsNone(uc.unwrap_url(url), url)
+
+    def test_nested_wrappers_limited(self):
+        url = self.INNER
+        for _ in range(5):
+            url = "https://www.google.com/url?q=" + urllib.parse.quote(url, safe="")
+        self.assertEqual(len(uc.unwrap_chain(url)), uc.MAX_UNWRAP)
+
+    def test_wrapped_phishing_link_is_analysed_inside(self):
+        url = "https://eur01.safelinks.protection.outlook.com/?url=%s" % urllib.parse.quote("https://paypa1.com", safe="")
+        entries = uc.check_one(url)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[1]["wrapper"], "Microsoft SafeLinks")
+        self.assertIn("lookalike-brand", {f[1] for f in entries[1]["findings"]})
+        self.assertTrue(all(f[0] == "LOW" for f in entries[0]["findings"]))  # the gateway link itself is not the problem
+
+    def test_unwrapping_never_touches_the_network(self):
+        with mock.patch("socket.socket", side_effect=AssertionError("network used")), \
+                mock.patch("socket.getaddrinfo", side_effect=AssertionError("dns used")):
+            uc.check_one("https://www.google.com/url?q=https%3A%2F%2Fpaypa1.com")
+
+
+def run_main(*argv, stdin=""):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch("sys.stdin", io.StringIO(stdin)):
+        code = uc.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class CliTests(unittest.TestCase):
+    def test_json_output_is_defanged(self):
+        code, out, _ = run_main("--json", "https://paypa1.com/login", "https://example.com")
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(data[0]["url"], "hxxps://paypa1[.]com/login")
+        self.assertEqual((data[0]["severity"], data[1]["severity"]), ("HIGH", None))
+        self.assertNotIn("https://", out)
+        self.assertEqual(data[0]["checked"][0]["findings"][0]["rule"], "lookalike-brand")
+
+    def test_json_wrapped_entry(self):
+        _, out, _ = run_main("--json", "https://www.google.com/url?q=https%3A%2F%2Fpaypa1.com")
+        checked = json.loads(out)[0]["checked"]
+        self.assertEqual([c["wrapper"] for c in checked], [None, "Google redirect"])
+        self.assertEqual(json.loads(out)[0]["severity"], "HIGH")
+
+    def test_text_output_shows_wrapper(self):
+        code, out, _ = run_main("https://www.google.com/url?q=https%3A%2F%2Fpaypa1.com")
+        self.assertEqual(code, 1)
+        self.assertIn("inside Google redirect wrapper: hxxps://paypa1[.]com", out)
+        self.assertIn("LIKELY PHISHING", out)
+
+    def test_file_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "urls.txt")
+            with open(p, "w") as fh:
+                fh.write("# from the ticket\nhttps://example.com\n\nhttps://paypa1.com\n")
+            code, out, _ = run_main("-f", p, "--json")
+        self.assertEqual((code, len(json.loads(out))), (1, 2))
+
+    def test_missing_file_and_no_input(self):
+        self.assertEqual(run_main("-f", "/nonexistent/urls.txt")[0], 2)
+        self.assertEqual(run_main(stdin="")[0], 2)
+
+    def test_stdin_still_works(self):
+        self.assertEqual(run_main(stdin="https://example.com\n")[0], 0)
+
+    def test_clean_url_exit_zero(self):
+        self.assertEqual(run_main("https://example.com/about")[0], 0)
+
+    def test_urls_in_text_output_are_defanged(self):
+        _, out, _ = run_main("https://paypa1.com")
+        self.assertNotIn("https://paypa1.com", out)
 
 
 if __name__ == "__main__":

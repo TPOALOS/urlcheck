@@ -12,6 +12,20 @@ One file, standard library only.
 python3 urlcheck.py "https://paypal.com@evil.example.net/login"
 python3 urlcheck.py http://3405803781/ https://paypa1.com
 pbpaste | python3 urlcheck.py              # one URL per line from stdin
+python3 urlcheck.py -f links.txt --json    # one URL per line, # comments ok; URLs stay defanged in the JSON
+# or: pip install git+https://github.com/TPOALOS/urlcheck && urlcheck 'https://paypa1.com'
+```
+
+### Wrapped links
+
+Security gateways and redirectors hide the real destination inside the link. urlcheck unwraps **Microsoft SafeLinks**,
+**Proofpoint URL Defense**, **Google** `/url?q=` and **Facebook** `l.php` links (up to 3 levels, purely by reading the text,
+never by following them) and analyses the inner URL too:
+
+```
+== hxxps://eur01[.]safelinks[.]protection[.]outlook[.]com/?url=...  ->  LIKELY PHISHING / DANGEROUS
+  inside Microsoft SafeLinks wrapper: hxxps://paypa1[.]com
+  HIGH   lookalike-brand        'paypa1' looks like 'paypal' (swapped or changed characters)
 ```
 
 URLs are shown *defanged* (`hxxps://example[.]com`) so the output is safe to paste into a chat or ticket.
@@ -27,9 +41,12 @@ URLs are shown *defanged* (`hxxps://example[.]com`) so the output is safe to pas
 
 | Rule | Severity | Meaning |
 |------|----------|---------|
+| `hidden-characters`, `double-extension` | HIGH | zero-width or direction-control characters in the URL, `invoice.pdf.exe`-style names |
 | `userinfo-trick`, `obfuscated-ip`, `mixed-scripts`, `lookalike-brand`, `script-scheme` | HIGH | `bank.com@evil.test`, decimal/hex IPs, Latin+Cyrillic mixes, `paypa1`/`rnicrosoft`/one-letter changes of ~25 well-known brands, `javascript:`/`data:` URLs |
+| `domain-in-subdomain` | MEDIUM | `mybank.com.secure-check.example.net`: the host starts like another domain |
 | `ip-host`, `punycode`, `non-ascii-host`, `brand-in-wrong-place`, `risky-file`, `encoded-host`, `malformed`, `file-scheme` | MEDIUM | raw IPs, `xn--` hosts, a brand name outside the registered domain, `.exe`/`.js`/`.iso`-style downloads, percent-encoded hosts |
 | `no-tls` | LOW, MEDIUM with login words | plain `http` |
+| `brand-in-path` | LOW | a brand name plus a login word in the path of an unrelated domain |
 | `shortener`, `abused-tld`, `many-subdomains`, `many-hyphens`, `odd-port`, `embedded-url`, `long-url` | LOW | context signals that are common in phishing but also in legitimate links |
 
 Exit codes: `0` no MEDIUM/HIGH signs (LOW only counts as fine), `1` suspicious, `2` no URL given.
